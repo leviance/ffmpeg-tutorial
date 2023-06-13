@@ -6,6 +6,7 @@ extern "C" {
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
 #include "libswscale/swscale.h"
+#include "libavutil/imgutils.h"
 }
 
 using namespace std;
@@ -43,6 +44,12 @@ int main(int argc, char *args[]) {
     if ((avformat_open_input(&format_ctx, file_path.data(), nullptr, nullptr)) < 0) {
         cerr << "Can't open input file with given path." << endl;
         return OPEN_INPUT_ERROR;
+    }
+
+    // Find stream info in input file
+    if ((avformat_find_stream_info(format_ctx, nullptr)) < 0) {
+        cerr << "Can't find stream info." << endl;
+        return FIND_STREAM_INFO_ERROR;
     }
 
     // Find audio and video stream
@@ -135,8 +142,6 @@ int main(int argc, char *args[]) {
         cerr << "Can't get sws context." << endl;
         return GET_SWS_CTX_ERROR;
     }
-
-
 
     // Read packet and decode into frame
     while (av_read_frame(format_ctx, packet) >= 0) {
