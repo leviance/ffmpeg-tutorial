@@ -16,6 +16,5 @@ pnpm-debug.log*
 *.njsproj
 *.sln
 *.sw?
-/src/wasm/cmake-build-debug/
 cmake-build-debug
 
