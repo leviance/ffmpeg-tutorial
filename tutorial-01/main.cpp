@@ -11,11 +11,24 @@ extern "C" {
 
 using namespace std;
 
-void save_frame() {
+void save_frame(AVCodecContext *video_codec_ctx, uint8_t *rgb_frame[4], int rgb_frame_linesize[4]) {
+    FILE *file = nullptr;
+    file = fopen("frame.ppm", "wb");
 
+    fprintf(file, "P6 %d %d 255\n", video_codec_ctx->width, video_codec_ctx->height);
+
+    for (int i = 0; i < video_codec_ctx->height; ++i) {
+        fwrite(rgb_frame[0] + i * rgb_frame_linesize[0], 1, rgb_frame_linesize[0], file);
+    }
+
+    fclose(file);
 }
 
 int main(int argc, char *args[]) {
+    int                     ret                     = 0;
+    int                     selected_frame_index    = 343;
+    int                     frame_count             = 0;
+    bool                    quit                    = false;
     AVFormatContext         *format_ctx             = nullptr;
     string                  file_path               = "../../videos/video.mp4";
     int                     video_stream_index      = -1;
@@ -143,10 +156,19 @@ int main(int argc, char *args[]) {
         return GET_SWS_CTX_ERROR;
     }
 
+    /* Alloc memory for store rgb data */
+    ret = av_image_alloc(rgb_frame, rgb_frame_linesize, video_codec_ctx->width, video_codec_ctx->height, AV_PIX_FMT_RGB24, 1);
+    if (ret < 0) {
+        cerr << "Can't alloc memory for RGB frame" << endl;
+        return ALLOC_RGB_FRAME_ERROR;
+    }
+
     // Read packet and decode into frame
     while (av_read_frame(format_ctx, packet) >= 0) {
+        if (quit) break;
+
         if (packet->stream_index == video_stream_index) {
-            int ret = avcodec_send_packet(video_codec_ctx, packet);
+            ret = avcodec_send_packet(video_codec_ctx, packet);
 
             if (ret == AVERROR_EOF) break;
 
@@ -164,8 +186,21 @@ int main(int argc, char *args[]) {
                     return SEND_VIDEO_FRAME_ERROR;
                 }
 
+                if (frame_count == selected_frame_index) {
+                    if (video_codec_ctx->pix_fmt != AV_PIX_FMT_RGB24) {
+                        /* Convert frame pixel format to RGB24 format */
+                        sws_scale(sws_ctx, frame->data, frame->linesize, 0, video_codec_ctx->height, rgb_frame, rgb_frame_linesize);
+                        save_frame(video_codec_ctx, rgb_frame, rgb_frame_linesize);
+                    }
+                    else {
+                        save_frame(video_codec_ctx, frame->data, frame->linesize);
+                    }
 
+                    quit = true;
+                    break;
+                }
 
+                frame_count++;
                 av_frame_unref(frame);
             }
 
@@ -182,6 +217,7 @@ int main(int argc, char *args[]) {
     av_packet_free(&packet);
     avcodec_free_context(&video_codec_ctx);
     avcodec_free_context(&audio_codec_ctx);
+    sws_freeContext(sws_ctx);
     avformat_free_context(format_ctx);
     cout << "COMPLETE" << endl;
 
