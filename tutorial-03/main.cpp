@@ -12,15 +12,17 @@ extern "C" {
 
 using namespace std;
 
+/**
+ * Queue implement for store AVPacket.
+ */
 struct PACKET_QUEUE {
 private:
-    AVPacket temp_packet{};
     AVPacketList *first_packet;
     AVPacketList *last_packet;
     SDL_mutex *mutex;
     SDL_cond *cond;
-    int size;
-    int length;
+    int _size;
+    int _length;
 
 public:
     PACKET_QUEUE() {
@@ -28,11 +30,32 @@ public:
         this->last_packet       = nullptr;
         this->mutex             = SDL_CreateMutex();
         this->cond              = SDL_CreateCond();
-        this->size              = 0;
-        this->length            = 0;
+        this->_size              = 0;
+        this->_length            = 0;
     }
 
-    void put(AVPacket *packet) {
+    /**
+     * Get size in bytes of all packets stored.
+     * @return size in bytes.
+     */
+    int size() const {
+        return this->_size;
+    }
+
+    /**
+     * Get number of packet stored in this queue.
+     * @return number of packet.
+     */
+    int length() const {
+        return this->_length;
+    }
+
+    /**
+     * Push new AVPacket in queue.
+     * @note Do not apply "av_packet_unref" or "av_packet_free" with packet passed into this function.
+     * @param packet packet want to store.
+     */
+    void push(AVPacket *packet) {
         SDL_LockMutex(this->mutex);
 
         auto *next_packet   = (AVPacketList*)(malloc(sizeof(AVPacketList)));
@@ -48,22 +71,41 @@ public:
             this->last_packet = this->last_packet->next;
         }
 
-        this->size += packet->size;
-        this->length += 1;
+        this->_size += packet->size;
+        this->_length += 1;
 
         SDL_UnlockMutex(this->mutex);
         SDL_CondSignal(this->cond);
     }
 
+    /**
+     * Retrieves a packet that has been pushed to the queue.
+     * @note AVPacket receive from this function need to be free with "av_packet_free" when they are no longer needed.
+     * @param wait if "wait" is true thread will be blocked if no packet in queue until a new packet pushed.
+     * @return "AVPacket" pointer or "nullptr" when no packet in queue ("nullptr" will just return when "wait" is false).
+     */
     AVPacket *get(bool wait) {
         SDL_LockMutex(this->mutex);
+        AVPacket *transit_packet = nullptr;
 
         for(;;) {
             if (this->first_packet) {
-                temp_packet = this->first_packet->pkt;
-                AVPacketList *foo = this->first_packet;
+                /* Update size and length of this queue */
+                this->_size -= this->first_packet->pkt.size;
+                this->_length -= 1;
+
+                // Alloc memory for a transit packet
+                transit_packet = av_packet_alloc();
+
+
+                // Copy data from packet stored in first_packet to transit_packet
+                *transit_packet = this->first_packet->pkt;
+
+                /* Move first_packet to next packet list and free old data */
+                AVPacketList *transit_packet_list = this->first_packet;
                 this->first_packet = this->first_packet->next;
-                free(foo);
+                free(transit_packet_list);
+
                 break;
             }
             else if (wait) {
@@ -77,7 +119,8 @@ public:
         }
 
         SDL_UnlockMutex(this->mutex);
-        return &temp_packet;
+        cout << transit_packet << endl;
+        return transit_packet;
     }
 };
 
@@ -319,32 +362,21 @@ int main(int argc, char *args[]) {
                 av_frame_unref(frame);
             }
 
+            av_packet_unref(packet);
         }
 
         // Audio stream
         else if (packet->stream_index == audio_stream_index) {
-            audio_packet_queue->put(packet);
+            audio_packet_queue->push(packet);
         }
 
         else {
-            av_frame_unref(frame);
+            av_packet_unref(packet);
         }
 
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) quit = true;
         }
-
-        av_packet_unref(packet);
-    }
-
-    for (int i = 0; i < 10; ++i) {
-        AVPacket *test_packet = audio_packet_queue->get(true);
-        if (test_packet) {
-            cout << "packet pts: " << test_packet->pts << endl;
-        }
-
-        av_packet_unref(test_packet);
-        cout << "d" << endl;
     }
 
     av_frame_free(&frame);
