@@ -7,6 +7,7 @@ extern "C" {
 #include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
 #include "libswscale/swscale.h"
+#include "libswresample/swresample.h"
 #include "libavutil/imgutils.h"
 }
 
@@ -119,15 +120,19 @@ public:
         }
 
         SDL_UnlockMutex(this->mutex);
-        cout << transit_packet << endl;
         return transit_packet;
     }
 };
 
+const int AUDIO_BUFFER_SIZE = 1024;
+const int MAX_AUDIO_FRAME_SIZE = 192000;
+
+bool            quit                    = false;
 PACKET_QUEUE    *audio_packet_queue     = new PACKET_QUEUE;
 SDL_Window      *window                 = nullptr;
 SDL_Renderer    *renderer               = nullptr;
 SDL_Texture     *texture                = nullptr;
+SDL_AudioSpec   audio_spec;
 SDL_Rect        display_rect;
 SDL_Event       event;
 
@@ -149,7 +154,7 @@ int init_sdl(const int SCREEN_WIDTH, const int SCREEN_HEIGHT) {
         return CREATE_SDL_WINDOW_ERROR;
     }
 
-    renderer = SDL_CreateRenderer(window, -1, 0);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC);
     if (renderer == nullptr) {
         cerr << "Can't create SDL renderer with error: " << SDL_GetError() << endl;
         return CREATE_SDL_RENDERER_ERROR;
@@ -169,9 +174,51 @@ int init_sdl(const int SCREEN_WIDTH, const int SCREEN_HEIGHT) {
     return 0;
 }
 
+void audio_convert() {
+
+}
+
+int audio_decode(AVCodecContext *audio_codec_ctx, uint8_t audio_buffer[]) {
+    AVPacket *audio_packet = audio_packet_queue->get(true);
+    AVFrame *audio_frame = av_frame_alloc();
+    if (audio_frame == nullptr) {
+        cerr << "Can't alloc memory for audio frame." << endl;
+        return ALLOC_FRAME_ERROR;
+    }
+
+    int ret = avcodec_send_packet(audio_codec_ctx, audio_packet);
+    if (ret < 0 && ret != AVERROR(EAGAIN)) {
+        cerr << "Can't send audio packet." << endl;
+        return SEND_AUDIO_PACKET_ERROR;
+    }
+
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(audio_codec_ctx, audio_frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+        else if (ret < 0) {
+            cerr << "Can't receive audio frame." << endl;
+            return SEND_AUDIO_FRAME_ERROR;
+        }
+    }
+
+    av_frame_free(&audio_frame);
+    av_packet_free(&audio_packet);
+    return 0;
+}
+
+void audio_callback(void *userdata, Uint8 *stream, int len) {
+    auto audio_codec_ctx = (AVCodecContext*)userdata;
+    static uint8_t audio_buffer[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
+
+    int length = audio_decode(audio_codec_ctx, audio_buffer);
+    if (length < 0) {
+        quit = true;
+        return;
+    }
+}
+
 int main(int argc, char *args[]) {
     int                     ret                         = 0;
-    bool                    quit                        = false;
     AVFormatContext         *format_ctx                 = nullptr;
     string                  file_path                   = "../../videos/video.mp4";
     int                     video_stream_index          = -1;
@@ -310,6 +357,33 @@ int main(int argc, char *args[]) {
     if ((ret = init_sdl(video_codec_ctx->width, video_codec_ctx->height)) < 0) {
         return ret;
     }
+
+    /* Setup SDL audio */
+    audio_spec.freq = audio_codec_ctx->sample_rate;
+    audio_spec.format = AUDIO_S16SYS;
+    audio_spec.channels = video_codec_ctx->ch_layout.nb_channels;
+    audio_spec.silence = 0;
+    audio_spec.samples = AUDIO_BUFFER_SIZE;
+    audio_spec.callback = audio_callback;
+    audio_spec.userdata = audio_codec_ctx;
+
+    if (SDL_OpenAudio(&audio_spec, nullptr) < 0) {
+        cerr << "Can't open SDL audio with error: " << SDL_GetError() << endl;
+        return OPEN_SDL_AUDIO_ERROR;
+    }
+
+    SDL_PauseAudio(0);
+
+
+    SwrContext *swr_ctx = nullptr;
+    swr_ctx = swr_alloc_set_opts(nullptr, audio_codec_ctx->channels, AV_SAMPLE_FMT_S16, 44100,
+                        audio_codec_ctx->channels, AV_SAMPLE_FMT_FLTP, 44100,
+                        0, nullptr);
+    if (swr_ctx == nullptr) {
+        cerr << "Can't alloc memory for SwrContext." << endl;
+        return ALLOC_SWR_CONTEXT_ERROR;
+    }
+
 
     // Read packet and decode into frame
     while (av_read_frame(format_ctx, packet) >= 0) {
