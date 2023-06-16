@@ -197,7 +197,7 @@ int audio_decode(AVCodecContext *audio_codec_ctx, uint8_t audio_buffer[]) {
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
         else if (ret < 0) {
             cerr << "Can't receive audio frame." << endl;
-            return SEND_AUDIO_FRAME_ERROR;
+            return RECEIVE_AUDIO_FRAME_ERROR;
         }
     }
 
@@ -207,14 +207,14 @@ int audio_decode(AVCodecContext *audio_codec_ctx, uint8_t audio_buffer[]) {
 }
 
 void audio_callback(void *userdata, Uint8 *stream, int len) {
-    auto audio_codec_ctx = (AVCodecContext*)userdata;
-    static uint8_t audio_buffer[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
-
-    int length = audio_decode(audio_codec_ctx, audio_buffer);
-    if (length < 0) {
-        quit = true;
-        return;
-    }
+    // auto audio_codec_ctx = (AVCodecContext*)userdata;
+    // static uint8_t audio_buffer[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
+    //
+    // int length = audio_decode(audio_codec_ctx, audio_buffer);
+    // if (length < 0) {
+    //     quit = true;
+    //     return;
+    // }
 }
 
 int main(int argc, char *args[]) {
@@ -234,6 +234,7 @@ int main(int argc, char *args[]) {
     AVPacket                *packet                     = nullptr;
     AVFrame                 *frame                      = nullptr;
     SwsContext              *sws_ctx                    = nullptr;
+    SwrContext              *swr_ctx                    = nullptr;
     uint8_t                 *yuv420_frame[4]            = {nullptr};
     int                     yuv420_frame_linesize[4]    = {0};
 
@@ -374,16 +375,26 @@ int main(int argc, char *args[]) {
 
     SDL_PauseAudio(0);
 
+    /*  */
+    AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_MONO;
 
-    SwrContext *swr_ctx = nullptr;
-    swr_ctx = swr_alloc_set_opts(nullptr, audio_codec_ctx->channels, AV_SAMPLE_FMT_S16, 44100,
-                        audio_codec_ctx->channels, AV_SAMPLE_FMT_FLTP, 44100,
-                        0, nullptr);
-    if (swr_ctx == nullptr) {
-        cerr << "Can't alloc memory for SwrContext." << endl;
+    ret = swr_alloc_set_opts2(&swr_ctx,
+                              &out_ch_layout, AV_SAMPLE_FMT_S16, audio_codec_ctx->sample_rate,
+                              &audio_codec_ctx->ch_layout, audio_codec_ctx->sample_fmt, audio_codec_ctx->sample_rate,
+                              0, nullptr);
+    if (ret < 0) {
+        cerr << "Can't alloc SwrContext." << endl;
         return ALLOC_SWR_CONTEXT_ERROR;
     }
 
+    ret = swr_init(swr_ctx);
+    if (ret < 0) {
+        cerr << "Can't init SwrContext." << endl;
+        return INIT_SWR_CONTEXT_ERROR;
+    }
+
+    uint8_t *audio_data[4] = {nullptr};
+    int audio_linesize[4] = {0};
 
     // Read packet and decode into frame
     while (av_read_frame(format_ctx, packet) >= 0) {
@@ -392,9 +403,6 @@ int main(int argc, char *args[]) {
         // Video stream
         if (packet->stream_index == video_stream_index) {
             ret = avcodec_send_packet(video_codec_ctx, packet);
-
-            if (ret == AVERROR_EOF) break;
-
             if (ret < 0 && ret != AVERROR(EAGAIN)) {
                 cerr << "Error when sending video packet." << endl;
                 return SEND_VIDEO_PACKET_ERROR;
@@ -406,7 +414,7 @@ int main(int argc, char *args[]) {
                 if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
                 else if (ret < 0) {
                     cerr << "Error when receive video frame." << endl;
-                    return SEND_VIDEO_FRAME_ERROR;
+                    return RECEIVE_VIDEO_FRAME_ERROR;
                 }
 
                 if (video_codec_ctx->pix_fmt != AV_PIX_FMT_YUV420P) {
@@ -441,7 +449,45 @@ int main(int argc, char *args[]) {
 
         // Audio stream
         else if (packet->stream_index == audio_stream_index) {
-            audio_packet_queue->push(packet);
+            // audio_packet_queue->push(packet);
+
+            ret = avcodec_send_packet(audio_codec_ctx, packet);
+            if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                cerr << "Error when sending audio packet." << endl;
+                return SEND_AUDIO_PACKET_ERROR;
+            }
+
+            while (ret >= 0) {
+                ret = avcodec_receive_frame(audio_codec_ctx, frame);
+
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                else if (ret < 0) {
+                    cerr << "Error when receive audio frame." << endl;
+                    return RECEIVE_AUDIO_FRAME_ERROR;
+                }
+
+                if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16) {
+
+                }
+                else {
+                    int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) + frame->nb_samples,
+                                                     audio_codec_ctx->sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
+
+                    cout << "Calculate number of out sample: " << out_samples << endl;
+
+                    // [ERROR]: memory leak in here!
+                    av_samples_alloc(audio_data, audio_linesize, audio_codec_ctx->channels, out_samples, AV_SAMPLE_FMT_S16, 0);
+
+                    out_samples = swr_convert(swr_ctx, audio_data, out_samples, (const uint8_t**)frame->data, frame->nb_samples);
+
+                    cout << "number of out sample after converted: " << out_samples << endl;
+                    cout << "audio frame linesize: " << audio_linesize[0] << endl;
+                }
+
+                av_frame_unref(frame);
+            }
+
+            av_packet_unref(packet);
         }
 
         else {
@@ -450,6 +496,18 @@ int main(int argc, char *args[]) {
 
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) quit = true;
+
+            if (event.type == SDL_KEYUP) {
+                switch (event.key.keysym.sym) {
+                    case SDLK_ESCAPE:
+                        quit = true;
+                        break;
+
+                    default:
+                        cout << "Unhandled key" << endl;
+                        break;
+                }
+            }
         }
     }
 
