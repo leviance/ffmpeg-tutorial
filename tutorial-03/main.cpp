@@ -174,21 +174,64 @@ int init_sdl(const int SCREEN_WIDTH, const int SCREEN_HEIGHT) {
     return 0;
 }
 
-void audio_convert() {
+int audio_resampling(AVCodecContext *audio_codec_ctx, uint8_t AUDIO_BUFFER[], AVFrame *audio_frame) {
+    int         ret                     = 0;
+    uint8_t     *audio_data[4]          = {nullptr};
+    int         audio_linesize[4]       = {0};
 
+    static SwrContext *swr_ctx = nullptr;
+    if (swr_ctx == nullptr) {
+        ret = swr_alloc_set_opts2(&swr_ctx,
+                                  &audio_codec_ctx->ch_layout, AV_SAMPLE_FMT_S16, audio_codec_ctx->sample_rate,
+                                  &audio_codec_ctx->ch_layout, audio_codec_ctx->sample_fmt, audio_codec_ctx->sample_rate,
+                                  0, nullptr);
+
+        if (ret < 0) {
+            cerr << "Can't alloc SwrContext." << endl;
+            return ALLOC_SWR_CONTEXT_ERROR;
+        }
+
+        ret = swr_init(swr_ctx);
+        if (ret < 0) {
+            cerr << "Can't init SwrContext." << endl;
+            return INIT_SWR_CONTEXT_ERROR;
+        }
+    }
+
+    int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) + audio_frame->nb_samples,
+                                     audio_codec_ctx->sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
+
+    av_samples_alloc(audio_data, audio_linesize, audio_codec_ctx->channels, out_samples, AV_SAMPLE_FMT_S16, 0);
+
+    out_samples = swr_convert(swr_ctx, audio_data, out_samples, (const uint8_t**)audio_frame->data, audio_frame->nb_samples);
+    if (out_samples < 0) {
+        cerr << "Convert audio data error." << endl;
+        return CONVERT_AUDIO_FRAME_ERROR;
+    }
+
+    memcpy(AUDIO_BUFFER, audio_data[0], out_samples);
+
+    for (auto & i : audio_data) if (i) av_freep(&i);
+    return out_samples;
 }
 
-int audio_decode(AVCodecContext *audio_codec_ctx, uint8_t audio_buffer[]) {
-    AVPacket *audio_packet = audio_packet_queue->get(true);
-    AVFrame *audio_frame = av_frame_alloc();
+int audio_decode(AVCodecContext *audio_codec_ctx, uint8_t AUDIO_BUFFER[]) {
+    AVPacket    *audio_packet   = audio_packet_queue->get(true);
+    AVFrame     *audio_frame    = av_frame_alloc();
+    int         buffer_len      = 0;
+
     if (audio_frame == nullptr) {
         cerr << "Can't alloc memory for audio frame." << endl;
+        av_frame_free(&audio_frame);
+        av_packet_free(&audio_packet);
         return ALLOC_FRAME_ERROR;
     }
 
     int ret = avcodec_send_packet(audio_codec_ctx, audio_packet);
     if (ret < 0 && ret != AVERROR(EAGAIN)) {
         cerr << "Can't send audio packet." << endl;
+        av_frame_free(&audio_frame);
+        av_packet_free(&audio_packet);
         return SEND_AUDIO_PACKET_ERROR;
     }
 
@@ -197,30 +240,83 @@ int audio_decode(AVCodecContext *audio_codec_ctx, uint8_t audio_buffer[]) {
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
         else if (ret < 0) {
             cerr << "Can't receive audio frame." << endl;
+            av_frame_free(&audio_frame);
+            av_packet_free(&audio_packet);
             return RECEIVE_AUDIO_FRAME_ERROR;
+        }
+
+        if (audio_codec_ctx->sample_fmt != AV_SAMPLE_FMT_S16) {
+            buffer_len = audio_resampling(audio_codec_ctx, AUDIO_BUFFER, audio_frame);
+        }
+        else {
+            buffer_len = audio_frame->linesize[0];
+            memcpy(AUDIO_BUFFER, audio_frame->data[0], buffer_len);
         }
     }
 
     av_frame_free(&audio_frame);
     av_packet_free(&audio_packet);
-    return 0;
+    return buffer_len;
 }
 
+/**
+ * SDL will call this function when need audio data to play audio.
+ *
+ * @note In this function we need decode audio packet and fill data we decoded to "stream". We need handle 3 cases could
+ *       happen is: error when decode audio packet (no audio data), audio data more than "stream" need and audio data
+ *       less than "stream" need.
+ *
+ * @param userdata pointer to out data we set with SDL_AudioSpec
+ * @param stream array of audio data SDL need to play audio
+ * @param len length of data stream needed
+ */
 void audio_callback(void *userdata, Uint8 *stream, int len) {
-    // auto audio_codec_ctx = (AVCodecContext*)userdata;
-    // static uint8_t audio_buffer[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
-    //
-    // int length = audio_decode(audio_codec_ctx, audio_buffer);
-    // if (length < 0) {
-    //     quit = true;
-    //     return;
-    // }
+    static auto *audio_codec_ctx = (AVCodecContext*)userdata;
+    static uint8_t AUDIO_BUFFER[MAX_AUDIO_FRAME_SIZE * 3 / 2] = {0};
+    static int first = 0, last = 0;
+
+    int stream_first = 0;
+
+    while (len > 0) {
+        int buffer_len = last - first;
+
+        // When we do not have any data in "AUDIO_BUFFER" start decoding.
+        if (buffer_len == 0) {
+            first = 0;
+
+            int ret = audio_decode(audio_codec_ctx, AUDIO_BUFFER);
+
+            if (last < 0) {
+                fill(stream, stream + len, 0);
+                break;
+            }
+
+            last = ret;
+            buffer_len = last - first;
+        }
+
+        if (buffer_len >= len) {
+            memcpy(stream + stream_first, AUDIO_BUFFER + first, len);
+            first += len;
+            break;
+        }
+
+        else {
+            memcpy(stream + stream_first, AUDIO_BUFFER + first, buffer_len);
+            len -= buffer_len;
+            stream_first += buffer_len;
+            first = 0;
+            last = 0;
+        }
+    }
 }
 
 int main(int argc, char *args[]) {
     int                     ret                         = 0;
     AVFormatContext         *format_ctx                 = nullptr;
-    string                  file_path                   = "../../videos/video.mp4";
+    string                  file_path                   = "../../videos/video.flv";
+    // string                  file_path                   = "C:/Users/Levi/Desktop/milan-hls/demo/videos/kenh14 1080p.ts";
+    // string                  file_path                   = "C:/Users/Levi/Desktop/milan-hls/demo/videos/kenh14 1080p.ts";
     int                     video_stream_index          = -1;
     int                     audio_stream_index          = -1;
     AVStream                *video_stream               = nullptr;
@@ -375,11 +471,8 @@ int main(int argc, char *args[]) {
 
     SDL_PauseAudio(0);
 
-    /*  */
-    AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_MONO;
-
     ret = swr_alloc_set_opts2(&swr_ctx,
-                              &out_ch_layout, AV_SAMPLE_FMT_S16, audio_codec_ctx->sample_rate,
+                              &audio_codec_ctx->ch_layout, AV_SAMPLE_FMT_S16, audio_codec_ctx->sample_rate,
                               &audio_codec_ctx->ch_layout, audio_codec_ctx->sample_fmt, audio_codec_ctx->sample_rate,
                               0, nullptr);
     if (ret < 0) {
@@ -441,6 +534,9 @@ int main(int argc, char *args[]) {
                 // Rendering video frame
                 SDL_RenderPresent(renderer);
 
+                double pts = (double)frame->pts * (double)video_stream->time_base.num / (double)video_stream->time_base.den * 1000.0;
+                // printf("video pts: %f\n", pts);
+
                 av_frame_unref(frame);
             }
 
@@ -449,45 +545,7 @@ int main(int argc, char *args[]) {
 
         // Audio stream
         else if (packet->stream_index == audio_stream_index) {
-            // audio_packet_queue->push(packet);
-
-            ret = avcodec_send_packet(audio_codec_ctx, packet);
-            if (ret < 0 && ret != AVERROR(EAGAIN)) {
-                cerr << "Error when sending audio packet." << endl;
-                return SEND_AUDIO_PACKET_ERROR;
-            }
-
-            while (ret >= 0) {
-                ret = avcodec_receive_frame(audio_codec_ctx, frame);
-
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                else if (ret < 0) {
-                    cerr << "Error when receive audio frame." << endl;
-                    return RECEIVE_AUDIO_FRAME_ERROR;
-                }
-
-                if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16) {
-
-                }
-                else {
-                    int out_samples = av_rescale_rnd(swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) + frame->nb_samples,
-                                                     audio_codec_ctx->sample_rate, audio_codec_ctx->sample_rate, AV_ROUND_UP);
-
-                    cout << "Calculate number of out sample: " << out_samples << endl;
-
-                    // [ERROR]: memory leak in here!
-                    av_samples_alloc(audio_data, audio_linesize, audio_codec_ctx->channels, out_samples, AV_SAMPLE_FMT_S16, 0);
-
-                    out_samples = swr_convert(swr_ctx, audio_data, out_samples, (const uint8_t**)frame->data, frame->nb_samples);
-
-                    cout << "number of out sample after converted: " << out_samples << endl;
-                    cout << "audio frame linesize: " << audio_linesize[0] << endl;
-                }
-
-                av_frame_unref(frame);
-            }
-
-            av_packet_unref(packet);
+            audio_packet_queue->push(packet);
         }
 
         else {
