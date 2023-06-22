@@ -209,10 +209,10 @@ int audio_resampling(AVCodecContext *audio_codec_ctx, uint8_t AUDIO_BUFFER[], AV
         return CONVERT_AUDIO_FRAME_ERROR;
     }
 
-    memcpy(AUDIO_BUFFER, audio_data[0], out_samples);
+    memcpy(AUDIO_BUFFER, audio_data[0], audio_linesize[0]);
 
     for (auto & i : audio_data) if (i) av_freep(&i);
-    return out_samples;
+    return audio_linesize[0];
 }
 
 int audio_decode(AVCodecContext *audio_codec_ctx, uint8_t AUDIO_BUFFER[]) {
@@ -315,8 +315,6 @@ int main(int argc, char *args[]) {
     int                     ret                         = 0;
     AVFormatContext         *format_ctx                 = nullptr;
     string                  file_path                   = "../../videos/video.flv";
-    // string                  file_path                   = "C:/Users/Levi/Desktop/milan-hls/demo/videos/kenh14 1080p.ts";
-    // string                  file_path                   = "C:/Users/Levi/Desktop/milan-hls/demo/videos/kenh14 1080p.ts";
     int                     video_stream_index          = -1;
     int                     audio_stream_index          = -1;
     AVStream                *video_stream               = nullptr;

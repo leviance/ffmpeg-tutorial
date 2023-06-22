@@ -59,7 +59,7 @@ int main(int argc, char *args[]) {
     int                     ret                         = 0;
     bool                    quit                        = false;
     AVFormatContext         *format_ctx                 = nullptr;
-    string                  file_path                   = "../../videos/video.mp4";
+    string                  file_path                   = "../../videos/video.flv";
     int                     video_stream_index          = -1;
     int                     audio_stream_index          = -1;
     AVStream                *video_stream               = nullptr;
